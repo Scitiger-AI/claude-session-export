@@ -25,6 +25,167 @@ ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
+# ─── cleanupPeriodDays 配置 ──────────────────────────────────────────────
+
+configure_cleanup_period() {
+    echo ""
+    info "检查 cleanupPeriodDays 配置..."
+    info "（该设置控制 Claude Code 会话记录保留天数，默认 30 天会自动清理）"
+    echo ""
+
+    # 收集所有 settings 文件
+    local files=()
+    local labels=()
+    local statuses=()   # "ok" | "missing" | "low"
+    local current_values=()
+
+    for f in "${CLAUDE_DIR}"/settings*.json; do
+        [[ -f "$f" ]] || continue
+        files+=("$f")
+
+        # 提取文件显示名
+        local basename
+        basename="$(basename "$f")"
+        labels+=("$basename")
+
+        # 用 python3 读取当前值和提供者信息
+        local result
+        result="$(python3 -c "
+import json, sys
+try:
+    with open('$f') as fh:
+        data = json.load(fh)
+    val = data.get('cleanupPeriodDays', None)
+    # 提取提供者标签
+    env = data.get('env', {})
+    base_url = env.get('ANTHROPIC_BASE_URL', env.get('CLAUDE_CODE_USE_BEDROCK', ''))
+    model = env.get('ANTHROPIC_MODEL', '')
+    desc_parts = []
+    if 'duckcoding' in base_url: desc_parts.append('DuckCoding')
+    elif 'dashscope' in base_url: desc_parts.append('阿里云')
+    elif 'openclaudecode' in base_url: desc_parts.append('OpenClaudeCode')
+    elif 'bytecat' in base_url: desc_parts.append('ByteCat')
+    elif base_url: desc_parts.append(base_url.split('//')[1].split('/')[0] if '//' in base_url else base_url[:30])
+    if model: desc_parts.append(model)
+    desc = ' - '.join(desc_parts) if desc_parts else 'Claude Default'
+    print(f'{val}|||{desc}')
+except Exception as e:
+    print(f'error|||{e}')
+" 2>/dev/null)"
+
+        local val="${result%%|||*}"
+        local desc="${result##*|||}"
+
+        if [[ "$val" == "None" ]]; then
+            statuses+=("missing")
+            current_values+=("")
+            labels[${#labels[@]}-1]="${basename}  (${desc})  ⚠️  未配置"
+        elif [[ "$val" -ge 365 ]] 2>/dev/null; then
+            statuses+=("ok")
+            current_values+=("$val")
+            labels[${#labels[@]}-1]="${basename}  (${desc})  ✅ ${val}天"
+        else
+            statuses+=("low")
+            current_values+=("$val")
+            labels[${#labels[@]}-1]="${basename}  (${desc})  ⚠️  仅${val}天"
+        fi
+    done
+
+    # 没有 settings 文件
+    if [[ ${#files[@]} -eq 0 ]]; then
+        warn "未检测到 ~/.claude/settings*.json 文件，跳过配置。"
+        return
+    fi
+
+    # 检查是否全部已配置
+    local need_config=0
+    for s in "${statuses[@]}"; do
+        [[ "$s" != "ok" ]] && need_config=1 && break
+    done
+
+    if [[ $need_config -eq 0 ]]; then
+        ok "所有配置文件的 cleanupPeriodDays 均已设置（≥365天），无需修改。"
+        return
+    fi
+
+    # 显示文件列表
+    echo -e "  📋 检测到以下 Claude Code 配置文件：\n"
+    for i in "${!labels[@]}"; do
+        local num=$((i + 1))
+        echo -e "    ${BLUE}${num})${NC} ${labels[$i]}"
+    done
+    echo ""
+    echo -e "    ${BLUE}a)${NC} 全部选择"
+    echo -e "    ${BLUE}n)${NC} 跳过，不配置"
+    echo ""
+    echo -e "  ${YELLOW}⚙️  为防止会话记录被自动清理（默认30天），建议设置 cleanupPeriodDays=9999${NC}"
+    echo -n "  请选择要配置的文件 [a/1-${#files[@]}/逗号分隔/n跳过]: "
+    read -r choice
+
+    # 解析用户选择
+    local selected=()
+    case "$choice" in
+        n|N|"")
+            info "跳过 cleanupPeriodDays 配置。"
+            return
+            ;;
+        a|A)
+            for i in "${!files[@]}"; do
+                [[ "${statuses[$i]}" != "ok" ]] && selected+=("$i")
+            done
+            ;;
+        *)
+            # 解析逗号分隔的数字
+            IFS=',' read -ra nums <<< "$choice"
+            for num in "${nums[@]}"; do
+                num="$(echo "$num" | tr -d ' ')"
+                if [[ "$num" =~ ^[0-9]+$ ]] && [[ "$num" -ge 1 ]] && [[ "$num" -le ${#files[@]} ]]; then
+                    local idx=$((num - 1))
+                    if [[ "${statuses[$idx]}" == "ok" ]]; then
+                        info "$(basename "${files[$idx]}") 已配置（${current_values[$idx]}天），跳过。"
+                    else
+                        selected+=("$idx")
+                    fi
+                else
+                    warn "无效选项: $num，跳过。"
+                fi
+            done
+            ;;
+    esac
+
+    if [[ ${#selected[@]} -eq 0 ]]; then
+        info "没有需要修改的文件。"
+        return
+    fi
+
+    # 执行修改
+    echo ""
+    for idx in "${selected[@]}"; do
+        local f="${files[$idx]}"
+        local basename
+        basename="$(basename "$f")"
+
+        python3 -c "
+import json
+with open('$f', 'r') as fh:
+    data = json.load(fh)
+data['cleanupPeriodDays'] = 9999
+with open('$f', 'w') as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write('\n')
+" 2>/dev/null
+
+        if [[ $? -eq 0 ]]; then
+            ok "${basename}: cleanupPeriodDays = 9999 ✅"
+        else
+            error "${basename}: 修改失败"
+        fi
+    done
+
+    echo ""
+    ok "配置完成！会话记录将长期保留（约 27 年）。"
+}
+
 # ─── 安装 ─────────────────────────────────────────────────────────────────
 
 install() {
@@ -81,6 +242,11 @@ install() {
 
     echo ""
     ok "安装完成！"
+    echo ""
+
+    # 配置 cleanupPeriodDays
+    configure_cleanup_period
+
     echo ""
     info "使用方法："
     echo "  在 Claude Code 中执行: /session-export [项目路径]"
