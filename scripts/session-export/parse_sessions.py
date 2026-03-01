@@ -1266,10 +1266,6 @@ def main():
             "stats": data["stats"],
             "sessions": data["sessions_compressed"],
         }
-        # 移除完整消息中的冗余字段
-        for s in output["sessions"]:
-            s.pop("messages", None)
-            # 保留 compressed sessions 的 messages
         json.dump(output, sys.stdout, ensure_ascii=False, indent=2)
         return
 
