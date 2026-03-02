@@ -1,13 +1,13 @@
 # Claude Session Export
 
-导出并分析 Claude Code 会话记录，生成自包含 HTML 可视化报告。
+导出 Claude Code 会话记录，生成 Markdown 文件 + 自包含 HTML 可视化报告。
 
 ## 功能
 
 - **会话解析**：从 `~/.claude/projects/` 提取指定项目的所有 JSONL 会话记录
-- **AI 总结**：由 Claude 自动分析开发历程、核心工作、问题与解决方案、技术决策
+- **Markdown 导出**：每个会话生成独立 `.md` 文件（含 YAML front matter），附带 `index.md` 索引
 - **HTML 报告**：生成 SPA 风格的自包含 HTML，支持深色/浅色主题切换
-- **统计面板**：会话数、消息数、Token 用量、工具使用排行等
+- **统计面板**：会话数、消息数、Token 用量、工具使用排行、会话概览列表
 
 ## 安装
 
@@ -20,14 +20,42 @@ bash ~/claude-session-export/install.sh
 
 ## 使用
 
-在 Claude Code 中执行：
+### 在 Claude Code 中使用（推荐）
 
 ```
 /session-export              # 导出当前项目的会话记录
 /session-export /path/to/dir # 导出指定项目的会话记录
 ```
 
-生成的 HTML 报告保存在项目根目录下：`claude-session-report.html`
+### 命令行直接使用
+
+```bash
+# 完整导出（Markdown + HTML）
+python3 scripts/session-export/parse_sessions.py -p /path/to/project --export
+
+# 仅导出 Markdown
+python3 scripts/session-export/parse_sessions.py -p /path/to/project --export-md
+
+# 仅生成 HTML 报告
+python3 scripts/session-export/parse_sessions.py -p /path/to/project --html -o report.html
+
+# 指定输出目录
+python3 scripts/session-export/parse_sessions.py -p /path/to/project --export -d /tmp/my-sessions/
+
+# 输出 JSON 格式数据到 stdout
+python3 scripts/session-export/parse_sessions.py -p /path/to/project
+```
+
+### 输出目录结构
+
+```
+<project-path>/claude-sessions/
+├── index.md                          # 索引：统计概览 + 工具排行 + 会话列表
+├── 001_2025-02-28_初始化项目结构.md   # 会话 Markdown 文件
+├── 002_2025-03-01_修复登录Bug.md
+├── ...
+└── report.html                       # 自包含 HTML 可视化报告
+```
 
 ## 卸载
 
@@ -43,7 +71,7 @@ claude-session-export/
 │   └── session-export.md       # Skill 命令定义
 ├── scripts/
 │   └── session-export/
-│       └── parse_sessions.py   # 会话解析 & HTML 生成脚本
+│       └── parse_sessions.py   # 会话解析 & 导出脚本
 ├── install.sh                  # 安装/卸载脚本
 └── README.md
 ```
@@ -55,11 +83,11 @@ claude-session-export/
 
 ## 报告内容
 
-### 📊 总结页
+### 📊 总览页
 
 - 统计卡片：会话数、消息数、Token 用量、时长
-- AI 分析报告：开发历程、核心工作、问题与方案、技术决策、开发模式
 - 工具使用排行榜
+- 会话概览列表：每个会话显示日期、时长、消息数、Token、Top 工具，点击跳转详情
 
 ### 💬 会话页
 

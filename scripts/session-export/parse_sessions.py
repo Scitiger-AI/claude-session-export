@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Claude Code 会话解析器 - 从 JSONL 文件提取结构化会话数据。
+"""Claude Code 会话解析器 - 从 JSONL 文件提取结构化会话数据并导出。
 
 用法:
-    python3 parse_sessions.py --project-path /path/to/project [--max-rounds 5] [--json]
+    python3 parse_sessions.py --project-path /path/to/project [--json]
     python3 parse_sessions.py --project-path /path/to/project --html -o report.html
+    python3 parse_sessions.py --project-path /path/to/project --export [-d output_dir]
+    python3 parse_sessions.py --project-path /path/to/project --export-md [-d output_dir]
 
 输出模式:
-    --json   输出结构化 JSON 到 stdout（默认）
-    --html   生成自包含 HTML 报告文件
+    --json        输出结构化 JSON 到 stdout（默认）
+    --html        生成自包含 HTML 报告文件
+    --export      导出 Markdown 会话文件 + HTML 报告
+    --export-md   仅导出 Markdown 会话文件
 """
 
 from __future__ import annotations
@@ -15,7 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,10 +31,6 @@ from typing import Any
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
-
-# 每个会话保留的首尾完整轮数（用于上下文压缩）
-DEFAULT_HEAD_ROUNDS = 5
-DEFAULT_TAIL_ROUNDS = 5
 
 # 工具调用显示名称映射
 TOOL_DISPLAY = {
@@ -138,7 +140,11 @@ def _summarize_tool_call(name: str, inp: dict) -> dict:
     elif name == "AskUserQuestion":
         questions = inp.get("questions", [])
         if questions:
-            summary = questions[0].get("question", "")[:100]
+            q = questions[0]
+            if isinstance(q, dict):
+                summary = q.get("question", "")[:100]
+            elif isinstance(q, str):
+                summary = q[:100]
     else:
         # 通用：取第一个有值的字段
         for v in inp.values():
@@ -282,59 +288,10 @@ def parse_session_file(jsonl_path: Path) -> dict | None:
     }
 
 
-def compress_session(session: dict, head: int = DEFAULT_HEAD_ROUNDS, tail: int = DEFAULT_TAIL_ROUNDS) -> dict:
-    """压缩会话消息，保留首尾完整轮数，中间只保留摘要。
-
-    用于生成给 Claude 分析的精简版本。
-    """
-    msgs = session["messages"]
-    total = len(msgs)
-
-    if total <= (head + tail) * 2:
-        # 消息不多，不需要压缩
-        return session
-
-    compressed = dict(session)
-    head_msgs = msgs[:head * 2]  # 前 N 轮（每轮 user+assistant）
-    tail_msgs = msgs[-(tail * 2):]  # 后 N 轮
-    middle_msgs = msgs[head * 2:-(tail * 2)]
-
-    # 中间部分只保留摘要
-    middle_summary_parts = []
-    middle_tools: Counter = Counter()
-    for m in middle_msgs:
-        if m["role"] == "user":
-            # 用户消息截断到前100字
-            snippet = m["content"][:100]
-            if len(m["content"]) > 100:
-                snippet += "..."
-            middle_summary_parts.append(f"[用户] {snippet}")
-        for t in m.get("tools", []):
-            middle_tools[t["name"]] += 1
-
-    middle_placeholder = {
-        "role": "system",
-        "content": (
-            f"--- 中间省略 {len(middle_msgs)} 条消息 ---\n"
-            f"用户主要操作摘要:\n" +
-            "\n".join(f"  - {p}" for p in middle_summary_parts[:10]) +
-            (f"\n  ... 等共 {len(middle_summary_parts)} 条" if len(middle_summary_parts) > 10 else "") +
-            f"\n工具调用统计: {dict(middle_tools.most_common(5))}"
-        ),
-        "tools": [],
-        "timestamp": "",
-        "timestamp_display": "",
-    }
-
-    compressed["messages"] = head_msgs + [middle_placeholder] + tail_msgs
-    compressed["_compressed"] = True
-    compressed["_original_message_count"] = total
-    return compressed
-
 
 # ─── 项目级解析 ───────────────────────────────────────────────────────────
 
-def parse_project(project_path: str, max_rounds: int = 5) -> dict:
+def parse_project(project_path: str) -> dict:
     """解析指定项目的所有会话，返回完整的结构化数据。"""
     abs_path = os.path.abspath(project_path)
     dir_name = encode_project_path(abs_path)
@@ -377,16 +334,12 @@ def parse_project(project_path: str, max_rounds: int = 5) -> dict:
         last = sessions[-1]["end_time_display"][:10] if sessions[-1]["end_time_display"] else ""
         date_range = [first, last]
 
-    # 为 Claude 分析准备压缩版本
-    compressed_sessions = [compress_session(s, head=max_rounds, tail=max_rounds) for s in sessions]
-
     return {
         "project_path": abs_path,
         "project_name": Path(abs_path).name,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "data_dir": str(project_dir),
         "sessions": sessions,
-        "sessions_compressed": compressed_sessions,
         "stats": {
             "total_sessions": len(sessions),
             "total_messages": total_messages,
@@ -406,7 +359,7 @@ def parse_project(project_path: str, max_rounds: int = 5) -> dict:
 
 # ─── HTML 生成 ────────────────────────────────────────────────────────────
 
-def generate_html(data: dict, ai_summary: str = "") -> str:
+def generate_html(data: dict) -> str:
     """生成自包含的 SPA 风格 HTML 报告。"""
     project_name = data.get("project_name", "Unknown")
     export_time = data.get("export_time", "")
@@ -424,11 +377,6 @@ def generate_html(data: dict, ai_summary: str = "") -> str:
     )
     stats_json = escape_for_script_tag(
         json.dumps(stats, ensure_ascii=False, indent=None)
-    )
-
-    # 转义 AI 总结中的特殊字符
-    ai_summary_escaped = escape_for_script_tag(
-        json.dumps(ai_summary, ensure_ascii=False)
     )
 
     html = f"""<!DOCTYPE html>
@@ -914,13 +862,55 @@ body {{
   .app {{ flex-direction: column; }}
 }}
 
-/* 无 AI 总结时的提示 */
-.no-summary {{
-  text-align: center;
-  padding: 40px;
+/* 会话概览卡片 */
+.session-overview-item {{
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+}}
+.session-overview-item:hover {{
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}}
+.session-overview-item .soi-header {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}}
+.session-overview-item .soi-title {{
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}}
+.session-overview-item .soi-date {{
+  font-size: 12px;
   color: var(--text-muted);
 }}
-.no-summary .icon {{ font-size: 48px; margin-bottom: 16px; }}
+.session-overview-item .soi-meta {{
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}}
+.session-overview-item .soi-tools {{
+  margin-top: 6px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}}
+.session-overview-item .soi-tool-tag {{
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  border-radius: 8px;
+}}
 </style>
 </head>
 <body data-theme="dark">
@@ -933,7 +923,7 @@ body {{
     </div>
     <div class="sidebar-stats" id="sidebarStats"></div>
     <div class="sidebar-nav">
-      <button class="nav-btn active" data-view="summary" onclick="switchView('summary')">📊 总结</button>
+      <button class="nav-btn active" data-view="summary" onclick="switchView('summary')">📊 总览</button>
       <button class="nav-btn" data-view="sessions" onclick="switchView('sessions')">💬 会话</button>
     </div>
     <div class="session-list" id="sessionList"></div>
@@ -942,7 +932,7 @@ body {{
   <!-- 主内容 -->
   <div class="main-content">
     <div class="content-header">
-      <h3 id="contentTitle">开发总结报告</h3>
+      <h3 id="contentTitle">统计总览</h3>
       <div class="header-actions">
         <span style="font-size:11px;color:var(--text-muted)">导出于 {export_time}</span>
         <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">🌓</button>
@@ -958,7 +948,6 @@ body {{
 // ─── 数据 ──────────────────────────────────────────────
 const SESSIONS = {sessions_json};
 const STATS = {stats_json};
-const AI_SUMMARY = {ai_summary_escaped};
 
 let currentView = 'summary';
 let currentSessionIdx = -1;
@@ -1021,7 +1010,7 @@ function switchView(view) {{
 }}
 
 function showSummary() {{
-  document.getElementById('contentTitle').textContent = '开发总结报告';
+  document.getElementById('contentTitle').textContent = '统计总览';
   const body = document.getElementById('contentBody');
   const s = STATS;
 
@@ -1039,22 +1028,26 @@ function showSummary() {{
     `).join('');
   }}
 
-  let summaryHtml = '';
-  if (AI_SUMMARY) {{
-    summaryHtml = `
-      <div class="summary-section">
-        <div class="summary-text">${{renderMarkdown(AI_SUMMARY)}}</div>
+  // 会话概览列表
+  const sessionsOverviewHtml = SESSIONS.map((sess, i) => {{
+    const topTools = Object.entries(sess.tools_summary || {{}}).sort((a,b) => b[1]-a[1]).slice(0,3);
+    const toolTags = topTools.map(([name, count]) => `<span class="soi-tool-tag">${{name}} ${{count}}</span>`).join('');
+    return `
+      <div class="session-overview-item" onclick="showSession(${{i}})">
+        <div class="soi-header">
+          <span class="soi-title">#${{i+1}} ${{getSessionTitle(sess)}}</span>
+          <span class="soi-date">${{sess.start_time_display?.slice(0,10) || ''}}</span>
+        </div>
+        <div class="soi-meta">
+          <span>⏱ ${{sess.duration_minutes}} 分钟</span>
+          <span>💬 ${{sess.message_count}} 条消息</span>
+          <span>📊 ${{formatTokens(sess.token_usage?.total || 0)}} tokens</span>
+          <span>🌿 ${{sess.git_branch}}</span>
+        </div>
+        ${{toolTags ? `<div class="soi-tools">${{toolTags}}</div>` : ''}}
       </div>
     `;
-  }} else {{
-    summaryHtml = `
-      <div class="no-summary">
-        <div class="icon">📝</div>
-        <p>AI 总结尚未生成</p>
-        <p style="font-size:13px;margin-top:8px">使用 /session-export 命令可生成包含 AI 分析的完整报告</p>
-      </div>
-    `;
-  }}
+  }}).join('');
 
   body.innerHTML = `
     <div class="summary-report">
@@ -1085,11 +1078,14 @@ function showSummary() {{
         </div>
       </div>
 
-      ${{summaryHtml}}
-
       <div class="summary-section">
         <h3 style="margin-bottom:12px">🔧 工具使用排行</h3>
         ${{toolsHtml}}
+      </div>
+
+      <div class="summary-section">
+        <h3 style="margin-bottom:12px">📋 会话概览</h3>
+        ${{sessionsOverviewHtml}}
       </div>
     </div>
   `;
@@ -1207,6 +1203,229 @@ init();
     return html
 
 
+# ─── Markdown 导出 ─────────────────────────────────────────────────────
+
+
+def _session_filename(idx: int, session: dict) -> str:
+    """生成会话文件名：{序号:03d}_{日期}_{首条消息摘要}.md"""
+    date_part = ""
+    start = session.get("start_time_display", "")
+    if start:
+        date_part = start[:10]  # YYYY-MM-DD
+
+    # 取第一条用户消息作为摘要
+    summary = ""
+    for msg in session.get("messages", []):
+        if msg["role"] == "user":
+            text = msg["content"].replace("\n", " ").strip()
+            summary = text[:30]
+            break
+
+    if not summary:
+        summary = session.get("session_id", "unknown")[:8]
+
+    # 清理文件名中的非法字符
+    summary = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', summary)
+    summary = summary.strip('. ')
+    if not summary:
+        summary = "session"
+
+    return f"{idx + 1:03d}_{date_part}_{summary}.md"
+
+
+def _format_session_markdown(idx: int, session: dict) -> str:
+    """生成单个会话的 Markdown 内容。"""
+    lines: list[str] = []
+
+    # YAML front matter
+    lines.append("---")
+    lines.append(f"session_id: {session.get('session_id', '')}")
+    lines.append(f"start_time: {session.get('start_time_display', '')}")
+    lines.append(f"end_time: {session.get('end_time_display', '')}")
+    lines.append(f"duration_minutes: {session.get('duration_minutes', 0)}")
+    lines.append(f"message_count: {session.get('message_count', 0)}")
+    token = session.get("token_usage", {})
+    lines.append(f"tokens_input: {token.get('input', 0)}")
+    lines.append(f"tokens_output: {token.get('output', 0)}")
+    lines.append(f"tokens_total: {token.get('total', 0)}")
+    lines.append(f"model: {session.get('model', 'unknown')}")
+    lines.append(f"git_branch: {session.get('git_branch', 'unknown')}")
+
+    tools_summary = session.get("tools_summary", {})
+    if tools_summary:
+        top_tools = sorted(tools_summary.items(), key=lambda x: -x[1])[:5]
+        tools_str = ", ".join(f"{name}({count})" for name, count in top_tools)
+        lines.append(f"top_tools: {tools_str}")
+
+    lines.append("---")
+    lines.append("")
+
+    # 标题
+    # 取第一条用户消息作为标题
+    title = f"会话 #{idx + 1}"
+    for msg in session.get("messages", []):
+        if msg["role"] == "user":
+            text = msg["content"].replace("\n", " ").strip()
+            title_text = text[:60] + ("..." if len(text) > 60 else "")
+            title = f"会话 #{idx + 1}: {title_text}"
+            break
+    lines.append(f"# {title}")
+    lines.append("")
+
+    # 消息体
+    for msg in session.get("messages", []):
+        role = msg["role"]
+        ts = msg.get("timestamp_display", "")
+
+        if role == "user":
+            lines.append(f"## 👤 User {f'({ts})' if ts else ''}")
+        elif role == "assistant":
+            lines.append(f"## 🤖 Assistant {f'({ts})' if ts else ''}")
+        else:
+            lines.append(f"## ⚙️ System {f'({ts})' if ts else ''}")
+
+        lines.append("")
+        lines.append(msg.get("content", ""))
+        lines.append("")
+
+        # 工具调用
+        tools = msg.get("tools", [])
+        if tools:
+            lines.append("**工具调用：**")
+            for t in tools:
+                display = t.get("display", t.get("name", ""))
+                summary = t.get("summary", "")
+                if summary:
+                    lines.append(f"- {display}: `{summary}`")
+                else:
+                    lines.append(f"- {display}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _format_index_markdown(data: dict) -> str:
+    """生成索引文件：统计概览 + 工具排行 + 会话列表。"""
+    lines: list[str] = []
+    stats = data.get("stats", {})
+    sessions = data.get("sessions", [])
+
+    lines.append(f"# Claude Sessions - {data.get('project_name', 'Unknown')}")
+    lines.append("")
+    lines.append(f"> 导出时间: {data.get('export_time', '')}")
+    lines.append(f"> 项目路径: `{data.get('project_path', '')}`")
+    lines.append("")
+
+    # 统计概览
+    lines.append("## 📊 统计概览")
+    lines.append("")
+    lines.append("| 指标 | 值 |")
+    lines.append("|------|-----|")
+    lines.append(f"| 会话总数 | {stats.get('total_sessions', 0)} |")
+    lines.append(f"| 消息总数 | {stats.get('total_messages', 0)} |")
+    lines.append(f"| 用户消息 | {stats.get('total_user_messages', 0)} |")
+    lines.append(f"| 助手消息 | {stats.get('total_assistant_messages', 0)} |")
+    lines.append(f"| 总时长(分钟) | {stats.get('total_duration_minutes', 0)} |")
+    token = stats.get("token_usage", {})
+    lines.append(f"| Token 输入 | {token.get('input', 0):,} |")
+    lines.append(f"| Token 输出 | {token.get('output', 0):,} |")
+    lines.append(f"| Token 合计 | {token.get('total', 0):,} |")
+    date_range = stats.get("date_range", [])
+    if len(date_range) == 2:
+        lines.append(f"| 时间范围 | {date_range[0]} ~ {date_range[1]} |")
+    lines.append("")
+
+    # 工具排行
+    tools_ranking = stats.get("tools_ranking", [])
+    if tools_ranking:
+        lines.append("## 🔧 工具使用排行")
+        lines.append("")
+        lines.append("| 工具 | 次数 |")
+        lines.append("|------|------|")
+        for name, count in tools_ranking[:15]:
+            display = TOOL_DISPLAY.get(name, name)
+            lines.append(f"| {display} | {count} |")
+        lines.append("")
+
+    # 会话列表
+    lines.append("## 📋 会话列表")
+    lines.append("")
+    lines.append("| # | 日期 | 时长 | 消息数 | Tokens | 文件 |")
+    lines.append("|---|------|------|--------|--------|------|")
+    for i, s in enumerate(sessions):
+        date = s.get("start_time_display", "")[:10]
+        dur = s.get("duration_minutes", 0)
+        msgs = s.get("message_count", 0)
+        tokens = s.get("token_usage", {}).get("total", 0)
+        fname = _session_filename(i, s)
+        # 取第一条用户消息的前30字
+        title = ""
+        for msg in s.get("messages", []):
+            if msg["role"] == "user":
+                title = msg["content"].replace("\n", " ").strip()[:30]
+                break
+        title = title or s.get("session_id", "")[:8]
+        lines.append(f"| {i + 1} | {date} | {dur}min | {msgs} | {tokens:,} | [{fname}]({fname}) |")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def export_markdown_sessions(data: dict, output_dir: str) -> str:
+    """导出所有会话为 Markdown 文件，返回输出目录路径。"""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    sessions = data.get("sessions", [])
+
+    # 生成每个会话的 Markdown 文件
+    for i, session in enumerate(sessions):
+        fname = _session_filename(i, session)
+        content = _format_session_markdown(i, session)
+        fpath = out / fname
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    # 生成索引文件
+    index_content = _format_index_markdown(data)
+    with open(out / "index.md", "w", encoding="utf-8") as f:
+        f.write(index_content)
+
+    return str(out)
+
+
+def print_export_summary(data: dict, md_dir: str | None = None, html_path: str | None = None):
+    """通过 stderr 输出结果摘要（Claude 唯一能看到的输出）。"""
+    stats = data.get("stats", {})
+    project_name = data.get("project_name", "Unknown")
+    total_sessions = stats.get("total_sessions", 0)
+    total_messages = stats.get("total_messages", 0)
+    token_total = stats.get("token_usage", {}).get("total", 0)
+    date_range = stats.get("date_range", [])
+
+    lines = [
+        f"✅ 导出完成: {project_name}",
+        f"   会话数: {total_sessions}",
+        f"   消息数: {total_messages}",
+        f"   Token: {token_total:,}",
+    ]
+    if len(date_range) == 2:
+        lines.append(f"   时间范围: {date_range[0]} ~ {date_range[1]}")
+    if md_dir:
+        lines.append(f"   Markdown: {md_dir}/")
+    if html_path:
+        lines.append(f"   HTML: {html_path}")
+
+    print("\n".join(lines), file=sys.stderr)
+
+
+def generate_and_write_html(data: dict, output_path: str):
+    """封装 generate_html() + 文件写入。"""
+    html = generate_html(data)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
 # ─── 主入口 ───────────────────────────────────────────────────────────────
 
 def main():
@@ -1217,15 +1436,19 @@ def main():
         help="项目绝对路径",
     )
     parser.add_argument(
-        "--max-rounds",
-        type=int,
-        default=DEFAULT_HEAD_ROUNDS,
-        help=f"压缩模式下保留的首尾轮数 (默认: {DEFAULT_HEAD_ROUNDS})",
-    )
-    parser.add_argument(
         "--html",
         action="store_true",
-        help="生成 HTML 报告（而非 JSON）",
+        help="生成 HTML 报告文件",
+    )
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="导出 Markdown 会话文件 + HTML 报告",
+    )
+    parser.add_argument(
+        "--export-md",
+        action="store_true",
+        help="仅导出 Markdown 会话文件",
     )
     parser.add_argument(
         "--output", "-o",
@@ -1233,67 +1456,48 @@ def main():
         help="输出文件路径（仅 --html 模式）",
     )
     parser.add_argument(
-        "--ai-summary",
+        "--output-dir", "-d",
         default="",
-        help="AI 总结文本（将嵌入 HTML 报告）",
+        help="输出目录路径（--export / --export-md 模式，默认为 <项目路径>/claude-sessions/）",
     )
-    parser.add_argument(
-        "--ai-summary-file",
-        default="",
-        help="AI 总结文本文件路径（将嵌入 HTML 报告）",
-    )
-    parser.add_argument(
-        "--compressed-only",
-        action="store_true",
-        help="仅输出压缩后的会话数据（用于 AI 分析）",
-    )
-
     args = parser.parse_args()
 
     # 解析项目
-    data = parse_project(args.project_path, max_rounds=args.max_rounds)
+    data = parse_project(args.project_path)
 
     if "error" in data:
         print(f"错误: {data['error']}", file=sys.stderr)
         sys.exit(1)
 
-    if args.compressed_only:
-        # 输出压缩版本供 Claude 分析
-        output = {
-            "project_path": data["project_path"],
-            "project_name": data["project_name"],
-            "export_time": data["export_time"],
-            "stats": data["stats"],
-            "sessions": data["sessions_compressed"],
-        }
-        json.dump(output, sys.stdout, ensure_ascii=False, indent=2)
-        return
+    # 确定输出目录
+    output_dir = args.output_dir or os.path.join(args.project_path, "claude-sessions")
 
-    if args.html:
-        # 读取 AI 总结
-        ai_summary = args.ai_summary
-        if args.ai_summary_file and os.path.isfile(args.ai_summary_file):
-            with open(args.ai_summary_file, "r", encoding="utf-8") as f:
-                ai_summary = f.read()
+    if args.export:
+        # 导出 Markdown + HTML
+        md_dir = export_markdown_sessions(data, output_dir)
+        html_path = os.path.join(output_dir, "report.html")
+        generate_and_write_html(data, html_path)
+        print_export_summary(data, md_dir=md_dir, html_path=html_path)
 
-        html = generate_html(data, ai_summary=ai_summary)
+    elif args.export_md:
+        # 仅导出 Markdown
+        md_dir = export_markdown_sessions(data, output_dir)
+        print_export_summary(data, md_dir=md_dir)
 
+    elif args.html:
+        # 仅生成 HTML
         output_path = args.output
         if not output_path:
             output_path = os.path.join(
                 args.project_path,
                 "claude-session-report.html"
             )
+        generate_and_write_html(data, output_path)
+        print_export_summary(data, html_path=output_path)
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html)
-
-        print(f"HTML 报告已生成: {output_path}", file=sys.stderr)
     else:
-        # JSON 模式：输出完整数据（不含压缩版本）
-        output = dict(data)
-        output.pop("sessions_compressed", None)
-        json.dump(output, sys.stdout, ensure_ascii=False, indent=2)
+        # JSON 模式（默认）
+        json.dump(data, sys.stdout, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
